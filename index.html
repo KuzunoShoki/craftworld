@@ -805,6 +805,11 @@
                     playerPos.z = nextZ.z;
                 }
 
+                // --- ワールド境界ガード（端からの脱落防止） ---
+                const maxBound = (WORLD_SIZE / 2) - 0.5;
+                playerPos.x = Math.max(-maxBound, Math.min(maxBound, playerPos.x));
+                playerPos.z = Math.max(-maxBound, Math.min(maxBound, playerPos.z));
+
                 // --- Y軸（重力・着地・天井判定） ---
                 const nextY = playerPos.clone();
                 nextY.y += velocityY * delta;
@@ -838,6 +843,7 @@
                     velocityY = 0;
                 }
 
+                // 本当の地下深くに落ちた場合のみ死亡判定（誤爆防止）
                 if (playerPos.y < -20) triggerDeath();
 
                 // モブの更新
