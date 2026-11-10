@@ -516,7 +516,16 @@
                     }
                 }
             }
-            spawnHeight = getTerrainHeight(0, 0);
+            // スポーン地点（X=0, Z=0）の実際の表面高さを厳密に取得し、絶対に埋まらない安全な高さを算出
+            let exactSurfaceY = 0;
+            for (let y = WORLD_SIZE; y >= 0; y--) {
+                const checkPos = new THREE.Vector3(0.5, y + 0.5, 0.5);
+                if (objects.some(o => o.position.equals(checkPos) && o.blockType !== 9)) {
+                    exactSurfaceY = y;
+                    break;
+                }
+            }
+            spawnHeight = Math.max(exactSurfaceY, getTerrainHeight(0, 0)) + 2.5;
         }
 
         // --- ゲーム制御 ---
@@ -552,7 +561,7 @@
             deathScreen.style.display = 'none';
             hp = 20; clearMobsAndDrops(); updateHPUI();
             velocityY = 0;
-            controls.getObject().position.set(0, spawnHeight + 2, 0);
+            controls.getObject().position.set(0, spawnHeight, 0);
             gameState = 'PLAYING';
             controls.lock();
         }
@@ -581,7 +590,7 @@
             inventory = { zombieMeat: 0, 1: 5, 2: 5, 3: 5, 4: 5, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0 };
             clearMobsAndDrops(); updateHPUI();
             velocityY = 0;
-            controls.getObject().position.set(0, spawnHeight + 2, 0);
+            controls.getObject().position.set(0, spawnHeight, 0);
             controls.getObject().rotation.set(0, 0, 0);
         }
 
