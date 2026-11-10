@@ -780,7 +780,6 @@
 
                 const moveSpeed = isSprinting ? 22.0 : 14.0;
                 if (inputDir.lengthSq() > 0) {
-                    // カメラの向きに基づく相対ベクトル計算（PointerLockControls標準スタイル）
                     const camDir = new THREE.Vector3();
                     controls.getDirection(camDir);
                     camDir.y = 0;
@@ -833,14 +832,12 @@
                         }
                         canJump = true;
                         
-                        // 床面の位置へ補正
                         let testPos = playerPos.clone();
                         while (checkCollision(testPos)) {
                             testPos.y += 0.01;
                         }
                         playerPos.y = testPos.y;
                     } else {
-                        // 天井衝突処理
                         let testPos = playerPos.clone();
                         while (checkCollision(testPos)) {
                             testPos.y -= 0.01;
