@@ -551,7 +551,7 @@
         function respawnPlayer() {
             deathScreen.style.display = 'none';
             hp = 20; clearMobsAndDrops(); updateHPUI();
-            velocity.set(0, 0, 0);
+            velocityY = 0;
             controls.getObject().position.set(0, spawnHeight + 2, 0);
             gameState = 'PLAYING';
             controls.lock();
@@ -580,7 +580,7 @@
             playerStatus = { level: 1, exp: 0, nextLevelExp: 5, attack: 3, defense: 1 };
             inventory = { zombieMeat: 0, 1: 5, 2: 5, 3: 5, 4: 5, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0 };
             clearMobsAndDrops(); updateHPUI();
-            velocity.set(0, 0, 0);
+            velocityY = 0;
             controls.getObject().position.set(0, spawnHeight + 2, 0);
             controls.getObject().rotation.set(0, 0, 0);
         }
@@ -607,7 +607,8 @@
 
         // --- 操作＆入力 ---
         let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false, isSprinting = false, canJump = false;
-        const velocity = new THREE.Vector3(); let prevTime = performance.now();
+        let velocityY = 0;
+        let prevTime = performance.now();
 
         document.addEventListener('keydown', (e) => {
             if (gameState !== 'PLAYING') return;
@@ -626,7 +627,7 @@
                 case 'ShiftRight':
                 case 'ControlLeft':
                 case 'ControlRight': isSprinting = true; break;
-                case 'Space': if (canJump) { velocity.y = 8.5; canJump = false; } break;
+                case 'Space': if (canJump) { velocityY = 8.5; canJump = false; } break;
                 case 'Digit1': changeBlock(1); break; case 'Digit2': changeBlock(2); break;
                 case 'Digit3': changeBlock(3); break; case 'Digit4': changeBlock(4); break;
                 case 'Digit5': changeBlock(5); break; case 'Digit6': changeBlock(6); break;
@@ -765,67 +766,57 @@
                     } else { resetMining(); }
                 }
 
-                // 物理演算（減速と重力）
-                velocity.x -= velocity.x * 10.0 * delta; 
-                velocity.z -= velocity.z * 10.0 * delta; 
-                velocity.y -= 9.8 * 3.2 * delta;
+                // 重力計算
+                velocityY -= 9.8 * 3.2 * delta;
 
-                // 入力方向ベクトルの算出
-                const inputDir = new THREE.Vector3();
-                if (moveForward) inputDir.z -= 1;
-                if (moveBackward) inputDir.z += 1;
-                if (moveLeft) inputDir.x -= 1;
-                if (moveRight) inputDir.x += 1;
-                inputDir.normalize();
+                // --- 移動入力の完全定常制御 ---
+                const moveSpeed = isSprinting ? 7.5 : 4.5;
+                const camDir = new THREE.Vector3();
+                controls.getDirection(camDir);
+                camDir.y = 0;
+                camDir.normalize();
 
-                const moveSpeed = isSprinting ? 22.0 : 14.0;
-                if (inputDir.lengthSq() > 0) {
-                    const camDir = new THREE.Vector3();
-                    controls.getDirection(camDir);
-                    camDir.y = 0;
-                    camDir.normalize();
+                const sideDir = new THREE.Vector3().crossVectors(camDir, new THREE.Vector3(0, 1, 0)).normalize();
 
-                    const sideDir = new THREE.Vector3().crossVectors(camDir, new THREE.Vector3(0, 1, 0)).normalize();
+                const moveDir = new THREE.Vector3();
+                if (moveForward) moveDir.add(camDir);
+                if (moveBackward) moveDir.sub(camDir);
+                if (moveRight) moveDir.add(sideDir);
+                if (moveLeft) moveDir.sub(sideDir);
 
-                    const moveVector = new THREE.Vector3();
-                    moveVector.addScaledVector(camDir, -inputDir.z);
-                    moveVector.addScaledVector(sideDir, inputDir.x);
-                    moveVector.normalize();
-
-                    velocity.x += moveVector.x * moveSpeed * delta * 10.0;
-                    velocity.z += moveVector.z * moveSpeed * delta * 10.0;
+                if (moveDir.lengthSq() > 0) {
+                    moveDir.normalize();
                 }
+
+                const moveVX = moveDir.x * moveSpeed;
+                const moveVZ = moveDir.z * moveSpeed;
 
                 // --- 軸ごとの完全分離スライド移動（X軸） ---
                 const nextX = playerPos.clone();
-                nextX.x += velocity.x * delta;
+                nextX.x += moveVX * delta;
                 if (!checkCollision(nextX)) {
                     playerPos.x = nextX.x;
-                } else {
-                    velocity.x = 0;
                 }
 
                 // --- 軸ごとの完全分離スライド移動（Z軸） ---
                 const nextZ = playerPos.clone();
-                nextZ.z += velocity.z * delta;
+                nextZ.z += moveVZ * delta;
                 if (!checkCollision(nextZ)) {
                     playerPos.z = nextZ.z;
-                } else {
-                    velocity.z = 0;
                 }
 
                 // --- Y軸（重力・着地・天井判定） ---
                 const nextY = playerPos.clone();
-                nextY.y += velocity.y * delta;
+                nextY.y += velocityY * delta;
 
                 if (!checkCollision(nextY)) {
                     playerPos.y = nextY.y;
                     canJump = false;
                 } else {
-                    if (velocity.y < 0) {
+                    if (velocityY < 0) {
                         // 着地処理
-                        if (velocity.y < -14) { 
-                            const fallDamage = Math.floor((Math.abs(velocity.y) - 14) * 2.5); 
+                        if (velocityY < -14) { 
+                            const fallDamage = Math.floor((Math.abs(velocityY) - 14) * 2.5); 
                             if (fallDamage > 0) hp -= fallDamage; 
                             updateHPUI(); 
                             if (hp <= 0) triggerDeath(); 
@@ -844,7 +835,7 @@
                         }
                         playerPos.y = testPos.y;
                     }
-                    velocity.y = 0;
+                    velocityY = 0;
                 }
 
                 if (playerPos.y < -20) triggerDeath();
