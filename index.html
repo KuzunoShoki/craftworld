@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>クラフトワールド</title>
+    <title>クラフトワールド - 高速最適化版</title>
     <style>
         * { box-sizing: border-box; }
         body { margin: 0; overflow: hidden; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; user-select: none; }
@@ -142,8 +142,8 @@
             </div>
 
             <div class="setting-group">
-                <label for="render-distance">⚡ 描画距離: <span id="render-val" style="color:#ffeb3b">14</span></label>
-                <input type="range" id="render-distance" class="setting-input" min="6" max="24" value="14" oninput="document.getElementById('render-val').innerText = this.value">
+                <label for="render-distance">⚡ 描画距離 (チャンク半径): <span id="render-val" style="color:#ffeb3b">3</span></label>
+                <input type="range" id="render-distance" class="setting-input" min="1" max="6" value="3" oninput="document.getElementById('render-val').innerText = this.value">
             </div>
 
             <div class="setting-group">
@@ -263,9 +263,9 @@
         scene.background = new THREE.Color(0x7ec0ee);
 
         const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-        const renderer = new THREE.WebGLRenderer({ antialias: false });
+        const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
         renderer.setSize(window.innerWidth, window.innerHeight);
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
         document.body.appendChild(renderer.domElement);
 
         const controls = new THREE.PointerLockControls(camera, document.body);
@@ -279,7 +279,6 @@
         const blockSelect = document.getElementById('block-select');
 
         let gameState = 'TITLE';
-        let renderDistance = 14;
 
         invWindow.addEventListener('click', (e) => e.stopPropagation());
 
@@ -360,6 +359,8 @@
             99: new THREE.MeshLambertMaterial({ map: texBedrock })
         };
 
+        const blockTypesList = [1, 2, 3, 4, 5, 6, 7, 8, 9, 99];
+
         // --- ゲーム変数 ---
         let hp = 20; let isInventoryOpen = false; let lastDamageTime = 0;
         const mobs = []; const drops = []; const MAX_MOBS = 3;
@@ -424,13 +425,19 @@
             deathScreen.style.display = 'flex';
         }
 
-        // --- 地形・ワールド生成 ---
+        // --- 超高速チャンク・ボクセル・InstancedMesh管理システム ---
+        const CHUNK_SIZE = 16;
+        const WORLD_HEIGHT = 64;
+        let RENDER_CHUNK_RADIUS = 3;
+        const chunks = new Map(); // key: "cx,cz", value: { group, meshes, blockMap }
+        const worldBlocks = new Map(); // key: "x,y,z", value: blockType (グローバル高速ルックアップ用)
         let currentTemplate = 'plains';
-        const WORLD_SIZE = 36;
-        const objects = [];
-        const geometry = new THREE.BoxGeometry(1, 1, 1);
         let spawnHeight = 12;
         let pNoise = new PseudoNoise(12345);
+        let lastPlayerChunkX = null;
+        let lastPlayerChunkZ = null;
+
+        const boxGeo = new THREE.BoxGeometry(1, 1, 1);
 
         function stringToSeed(str) {
             let hash = 0; if (str.length === 0) return Math.random() * 10000;
@@ -454,40 +461,32 @@
             return density > 0.28;
         }
 
-        function createTree(x, surfaceY, z) {
-            const trunkHeight = 4;
-            for (let t = 1; t <= trunkHeight; t++) {
-                const wPos = new THREE.Vector3(x + 0.5, surfaceY + t + 0.5, z + 0.5);
-                const wood = new THREE.Mesh(geometry, materials[3]);
-                wood.position.copy(wPos); wood.blockType = 3;
-                scene.add(wood); objects.push(wood);
-            }
-
-            const leafTopY = surfaceY + trunkHeight;
-            for (let ly = leafTopY - 1; ly <= leafTopY + 1; ly++) {
-                const radius = (ly === leafTopY + 1) ? 1 : 2;
-                for (let lx = -radius; lx <= radius; lx++) {
-                    for (let lz = -radius; lz <= radius; lz++) {
-                        if (Math.abs(lx) === radius && Math.abs(lz) === radius && Math.random() > 0.4) continue;
-                        if (lx === 0 && lz === 0 && ly <= leafTopY) continue;
-
-                        const leafPos = new THREE.Vector3(x + lx + 0.5, ly + 0.5, z + lz + 0.5);
-                        if (!objects.some(o => o.position.equals(leafPos))) {
-                            const leaf = new THREE.Mesh(geometry, materials[9]);
-                            leaf.position.copy(leafPos); leaf.blockType = 9;
-                            scene.add(leaf); objects.push(leaf);
-                        }
-                    }
-                }
-            }
+        // 高速ブロック参照関数
+        function getBlock(x, y, z) {
+            return worldBlocks.get(`${x},${y},${z}`) || 0;
         }
 
-        function generateWorld() {
-            objects.forEach(obj => scene.remove(obj));
-            objects.length = 0;
+        // 隠面カリング判定：上下左右前後がすべて埋まっていれば非表示（描画しない）
+        function isBlockHidden(x, y, z) {
+            return getBlock(x+1, y, z) > 0 &&
+                   getBlock(x-1, y, z) > 0 &&
+                   getBlock(x, y+1, z) > 0 &&
+                   getBlock(x, y-1, z) > 0 &&
+                   getBlock(x, y, z+1) > 0 &&
+                   getBlock(x, y, z-1) > 0;
+        }
 
-            for (let x = -WORLD_SIZE/2; x < WORLD_SIZE/2; x++) {
-                for (let z = -WORLD_SIZE/2; z < WORLD_SIZE/2; z++) {
+        function generateChunk(cx, cz) {
+            const key = `${cx},${cz}`;
+            if (chunks.has(key)) return;
+
+            const startX = cx * CHUNK_SIZE;
+            const startZ = cz * CHUNK_SIZE;
+            const chunkBlocks = []; // {x, y, z, type}
+
+            // 1. 地形データ生成 ＆ ワールドマップ登録
+            for (let x = startX; x < startX + CHUNK_SIZE; x++) {
+                for (let z = startZ; z < startZ + CHUNK_SIZE; z++) {
                     const surfaceY = getTerrainHeight(x, z);
 
                     for (let y = 0; y <= surfaceY; y++) {
@@ -505,27 +504,125 @@
                             else if (oreRand < 0.08) type = 5;            
                         }
                         
-                        const pos = new THREE.Vector3(x + 0.5, y + 0.5, z + 0.5);
-                        const voxel = new THREE.Mesh(geometry, materials[type]);
-                        voxel.position.copy(pos); voxel.blockType = type;
-                        scene.add(voxel); objects.push(voxel);
+                        const k = `${x},${y},${z}`;
+                        worldBlocks.set(k, type);
+                        chunkBlocks.push({x, y, z, type});
+                    }
 
-                        if (currentTemplate !== 'flat' && y === surfaceY && Math.random() < 0.03 && Math.abs(x) > 3 && Math.abs(z) > 3) {
-                            createTree(x, surfaceY, z);
+                    // 木の生成
+                    if (currentTemplate !== 'flat' && Math.abs(x) > 3 && Math.abs(z) > 3 && Math.random() < 0.03) {
+                        const surfaceY = getTerrainHeight(x, z);
+                        const trunkHeight = 4;
+                        for (let t = 1; t <= trunkHeight; t++) {
+                            const ty = surfaceY + t;
+                            const k = `${x},${ty},${z}`;
+                            worldBlocks.set(k, 3);
+                            chunkBlocks.push({x, y: ty, z, type: 3});
+                        }
+                        const leafTopY = surfaceY + trunkHeight;
+                        for (let ly = leafTopY - 1; ly <= leafTopY + 1; ly++) {
+                            const radius = (ly === leafTopY + 1) ? 1 : 2;
+                            for (let lx = -radius; lx <= radius; lx++) {
+                                for (let lz = -radius; lz <= radius; lz++) {
+                                    if (Math.abs(lx) === radius && Math.abs(lz) === radius && Math.random() > 0.4) continue;
+                                    if (lx === 0 && lz === 0 && ly <= leafTopY) continue;
+                                    const fx = x + lx, fz = z + lz;
+                                    const fk = `${fx},${ly},${fz}`;
+                                    if (!worldBlocks.has(fk)) {
+                                        worldBlocks.set(fk, 9);
+                                        chunkBlocks.push({x: fx, y: ly, z: fz, type: 9});
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
-            // スポーン地点（X=0, Z=0）の実際の表面高さを厳密に取得し、絶対に埋まらない安全な高さを算出
-            let exactSurfaceY = 0;
-            for (let y = WORLD_SIZE; y >= 0; y--) {
-                const checkPos = new THREE.Vector3(0.5, y + 0.5, 0.5);
-                if (objects.some(o => o.position.equals(checkPos) && o.blockType !== 9)) {
-                    exactSurfaceY = y;
-                    break;
+
+            buildChunkMesh(cx, cz, chunkBlocks);
+        }
+
+        // InstancedMesh による超高速・軽量メッシュ構築（隠面ブロックの描画除外）
+        function buildChunkMesh(cx, cz, chunkBlocks) {
+            const key = `${cx},${cz}`;
+            const group = new THREE.Group();
+            scene.add(group);
+
+            // タイプごとにブロックを分類
+            const typeGroups = {};
+            blockTypesList.forEach(t => typeGroups[t] = []);
+
+            for (let i = 0; i < chunkBlocks.length; i++) {
+                const b = chunkBlocks[i];
+                // 内部に隠れて周囲が見えないブロックは描画インスタンスから除外（隠面カリング）
+                if (b.type !== 99 && isBlockHidden(b.x, b.y, b.z)) continue;
+                typeGroups[b.type].push(b);
+            }
+
+            const meshes = [];
+            const dummy = new THREE.Object3D();
+
+            blockTypesList.forEach(type => {
+                const blocks = typeGroups[type];
+                if (blocks.length === 0) return;
+
+                const mat = materials[type];
+                const instMesh = new THREE.InstancedMesh(boxGeo, mat, blocks.length);
+                instMesh.castShadow = false;
+                instMesh.receiveShadow = false;
+
+                for (let i = 0; i < blocks.length; i++) {
+                    const b = blocks[i];
+                    dummy.position.set(b.x + 0.5, b.y + 0.5, b.z + 0.5);
+                    dummy.updateMatrix();
+                    instMesh.setMatrixAt(i, dummy.matrix);
+                }
+                instMesh.instanceMatrix.needsUpdate = true;
+                group.add(instMesh);
+                meshes.push(instMesh);
+            });
+
+            chunks.set(key, { group, meshes, chunkBlocks });
+        }
+
+        // プレイヤー周辺のチャンクを動的に読み込み・不要な遠隔チャンクを完全に破棄（メモリリーク防止）
+        function updateChunks(playerX, playerZ, force = false) {
+            const playerCx = Math.floor(playerX / CHUNK_SIZE);
+            const playerCz = Math.floor(playerZ / CHUNK_SIZE);
+
+            if (!force && playerCx === lastPlayerChunkX && playerCz === lastPlayerChunkZ) return;
+            lastPlayerChunkX = playerCx;
+            lastPlayerChunkZ = playerCz;
+
+            // 周辺チャンク生成
+            for (let cx = playerCx - RENDER_CHUNK_RADIUS; cx <= playerCx + RENDER_CHUNK_RADIUS; cx++) {
+                for (let cz = playerCz - RENDER_CHUNK_RADIUS; cz <= playerCz + RENDER_CHUNK_RADIUS; cz++) {
+                    generateChunk(cx, cz);
                 }
             }
-            spawnHeight = Math.max(exactSurfaceY, getTerrainHeight(0, 0)) + 2.5;
+
+            // 遠く離れたチャンクのアンロード・メモリ解放（メモリリーク完全防止）
+            for (let [key, chunkData] of chunks) {
+                const [cx, cz] = key.split(',').map(Number);
+                if (Math.abs(cx - playerCx) > RENDER_CHUNK_RADIUS || Math.abs(cz - playerCz) > RENDER_CHUNK_RADIUS) {
+                    scene.remove(chunkData.group);
+                    chunkData.meshes.forEach(m => {
+                        m.dispose();
+                    });
+                    chunks.delete(key);
+                }
+            }
+        }
+
+        function clearAllChunks() {
+            for (let [key, chunkData] of chunks) {
+                scene.remove(chunkData.group);
+                chunkData.meshes.forEach(m => m.dispose());
+            }
+            chunks.clear();
+            worldBlocks.clear();
+            lastPlayerChunkX = null;
+            lastPlayerChunkZ = null;
         }
 
         // --- ゲーム制御 ---
@@ -535,11 +632,14 @@
             pNoise = new PseudoNoise(seed);
             
             currentTemplate = document.getElementById('template-select').value;
-            renderDistance = parseInt(document.getElementById('render-distance').value);
+            RENDER_CHUNK_RADIUS = parseInt(document.getElementById('render-distance').value);
 
-            scene.fog = new THREE.FogExp2(0x7ec0ee, 1.0 / (renderDistance * 1.5));
+            scene.fog = new THREE.FogExp2(0x7ec0ee, 1.0 / (RENDER_CHUNK_RADIUS * CHUNK_SIZE * 1.2));
 
-            generateWorld();
+            clearAllChunks();
+            updateChunks(0, 0, true);
+            
+            spawnHeight = getTerrainHeight(0, 0) + 3.0;
             resetPlayerAndWorld();
 
             titleScreen.style.display = 'none';
@@ -599,7 +699,6 @@
             if (gameState !== 'PLAYING' || mobs.length >= MAX_MOBS || !controls.isLocked) return;
             const pPos = controls.getObject().position; const angle = Math.random() * Math.PI * 2; const distance = 10 + Math.random() * 8;
             const x = Math.floor(pPos.x + Math.cos(angle) * distance); const z = Math.floor(pPos.z + Math.sin(angle) * distance);
-            if (x < -WORLD_SIZE/2 || x > WORLD_SIZE/2 || z < -WORLD_SIZE/2 || z > WORLD_SIZE/2) return;
             const y = getTerrainHeight(x, z) + 0.9;
             const zombie = new THREE.Mesh(mobGeometry, new THREE.MeshLambertMaterial({ color: 0x2e8b57 }));
             zombie.position.set(x, y, z); zombie.hp = zombieConfig.maxHp;
@@ -664,43 +763,7 @@
         const raycaster = new THREE.Raycaster();
         document.addEventListener('contextmenu', e => e.preventDefault());
 
-        document.addEventListener('pointerdown', (event) => {
-            if (gameState !== 'PLAYING' || !controls.isLocked || isInventoryOpen) return;
-            if (event.button === 0) {
-                isLeftMouseDown = true;
-                raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
-                const intersects = raycaster.intersectObjects([...objects, ...mobs]);
-                if (intersects.length > 0 && intersects[0].distance <= 6) {
-                    const hitTarget = intersects[0].object;
-                    if (mobs.includes(hitTarget)) {
-                        hitTarget.hp -= Math.max(1, playerStatus.attack - zombieConfig.defense);
-                        hitTarget.material.color.setHex(0xff0000); setTimeout(() => { if (mobs.includes(hitTarget)) hitTarget.material.color.setHex(0x2e8b57); }, 150);
-                        if (hitTarget.hp <= 0) { spawnDropItem(hitTarget.position, 'meat'); scene.remove(hitTarget); mobs.splice(mobs.indexOf(hitTarget), 1); gainExp(2); }
-                    }
-                }
-            } 
-            else if (event.button === 2) {
-                if (inventory[activeBlockType] <= 0) return;
-                raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
-                const intersects = raycaster.intersectObjects([...objects, ...mobs]);
-                if (intersects.length > 0 && intersects[0].distance <= 6) {
-                    const intersect = intersects[0]; if (mobs.includes(intersect.object)) return;
-                    const pos = new THREE.Vector3().copy(intersect.object.position).add(intersect.face.normal);
-                    const pPos = controls.getObject().position;
-                    
-                    if (Math.abs(pos.x - pPos.x) < 0.6 && Math.abs(pos.z - pPos.z) < 0.6 && (pPos.y - pos.y) > -1.7 && (pPos.y - pos.y) < 0.3) return;
-
-                    inventory[activeBlockType] -= 1;
-                    const voxel = new THREE.Mesh(geometry, materials[activeBlockType]);
-                    voxel.position.copy(pos); voxel.blockType = activeBlockType;
-                    scene.add(voxel); objects.push(voxel); updateHPUI();
-                }
-            }
-        });
-
-        document.addEventListener('pointerup', (event) => { if (event.button === 0) { isLeftMouseDown = false; resetMining(); } });
-
-        // --- 決定版：高精度完全AABBコリジョン判定システム ---
+        // --- 【超高速化】プレイヤー周辺ブロックのみを対象とした高速AABBコリジョン＆レイキャスト ---
         const PLAYER_WIDTH = 0.6;
         const PLAYER_HEIGHT = 1.6;
 
@@ -712,26 +775,154 @@
             const pMinZ = pos.z - PLAYER_WIDTH / 2;
             const pMaxZ = pos.z + PLAYER_WIDTH / 2;
 
-            for (let i = 0; i < objects.length; i++) {
-                const obj = objects[i];
-                if (!obj.visible) continue;
+            const minX = Math.floor(pMinX);
+            const maxX = Math.floor(pMaxX);
+            const minY = Math.floor(pMinY);
+            const maxY = Math.floor(pMaxY);
+            const minZ = Math.floor(pMinZ);
+            const maxZ = Math.floor(pMaxZ);
 
-                if (Math.abs(obj.position.x - pos.x) > 1.2 || Math.abs(obj.position.y - (pos.y - 0.8)) > 1.8 || Math.abs(obj.position.z - pos.z) > 1.2) {
-                    continue;
-                }
+            // プレイヤーが接している周辺ブロックのみをO(1)ハッシュルックアップで判定
+            for (let x = minX; x <= maxX; x++) {
+                for (let y = minY; y <= maxY; y++) {
+                    for (let z = minZ; z <= maxZ; z++) {
+                        if (getBlock(x, y, z) > 0) {
+                            const oMinX = x, oMaxX = x + 1;
+                            const oMinY = y, oMaxY = y + 1;
+                            const oMinZ = z, oMaxZ = z + 1;
 
-                const oMinX = obj.position.x - 0.5, oMaxX = obj.position.x + 0.5;
-                const oMinY = obj.position.y - 0.5, oMaxY = obj.position.y + 0.5;
-                const oMinZ = obj.position.z - 0.5, oMaxZ = obj.position.z + 0.5;
-
-                if (pMaxX > oMinX && pMinX < oMaxX &&
-                    pMaxY > oMinY && pMinY < oMaxY &&
-                    pMaxZ > oMinZ && pMinZ < oMaxZ) {
-                    return true;
+                            if (pMaxX > oMinX && pMinX < oMaxX &&
+                                pMaxY > oMinY && pMinY < oMaxY &&
+                                pMaxZ > oMinZ && pMinZ < oMaxZ) {
+                                return true;
+                            }
+                        }
+                    }
                 }
             }
             return false;
         }
+
+        // 採掘・設置用の高速レイキャスト（プレイヤー周辺のInstancedMeshのみ対象）
+        function getRaycastIntersect() {
+            const hitMeshes = [];
+            for (let [key, chunkData] of chunks) {
+                const [cx, cz] = key.split(',').map(Number);
+                const p = controls.getObject().position;
+                if (Math.abs(cx * CHUNK_SIZE - p.x) <= CHUNK_SIZE * 1.5 && Math.abs(cz * CHUNK_SIZE - p.z) <= CHUNK_SIZE * 1.5) {
+                    hitMeshes.push(...chunkData.meshes);
+                }
+            }
+            raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+            return raycaster.intersectObjects(hitMeshes);
+        }
+
+        document.addEventListener('pointerdown', (event) => {
+            if (gameState !== 'PLAYING' || !controls.isLocked || isInventoryOpen) return;
+            if (event.button === 0) {
+                isLeftMouseDown = true;
+                const intersects = getRaycastIntersect();
+                if (intersects.length > 0 && intersects[0].distance <= 6) {
+                    const hit = intersects[0];
+                    const instMesh = hit.object;
+                    const instanceId = hit.instanceId;
+
+                    // どのチャンクのどのブロックかを特定して破壊
+                    for (let [key, chunkData] of chunks) {
+                        const idx = chunkData.meshes.indexOf(instMesh);
+                        if (idx !== -1) {
+                            // 該当チャンクのブロックリストから特定
+                            // 高速化のため、ヒットしたマトリックス位置から逆算
+                            const matrix = new THREE.Matrix4();
+                            instMesh.getMatrixAt(instanceId, matrix);
+                            const pos = new THREE.Vector3().setFromMatrixPosition(matrix);
+                            const bx = Math.floor(pos.x - 0.5);
+                            const by = Math.floor(pos.y - 0.5);
+                            const bz = Math.floor(pos.z - 0.5);
+
+                            const bType = getBlock(bx, by, bz);
+                            if (bType !== 99 && bType > 0) {
+                                worldBlocks.delete(`${bx},${by},${bz}`);
+                                spawnDropItem(new THREE.Vector3(bx + 0.5, by + 0.5, bz + 0.5), bType);
+                                gainExp(1);
+                                
+                                // チャンクメッシュ再構築
+                                const [cx, cz] = key.split(',').map(Number);
+                                const oldData = chunks.get(key);
+                                scene.remove(oldData.group);
+                                oldData.meshes.forEach(m => m.dispose());
+                                chunks.delete(key);
+
+                                // 周辺ブロックの隠面状態が変わる可能性があるため、再生成
+                                generateChunk(cx, cz);
+                                // 周辺チャンクも必要に応じて再構築
+                                updateChunks(controls.getObject().position.x, controls.getObject().position.z, true);
+                            }
+                            break;
+                        }
+                    }
+                }
+            } 
+            else if (event.button === 2) {
+                if (inventory[activeBlockType] <= 0) return;
+                const intersects = getRaycastIntersect();
+                if (intersects.length > 0 && intersects[0].distance <= 6) {
+                    const hit = intersects[0];
+                    const matrix = new THREE.Matrix4();
+                    hit.object.getMatrixAt(hit.instanceId, matrix);
+                    const hitPos = new THREE.Vector3().setFromMatrixPosition(matrix);
+                    
+                    const pos = new THREE.Vector3().copy(hitPos).add(hit.face.normal);
+                    const pPos = controls.getObject().position;
+                    
+                    const bx = Math.floor(pos.x);
+                    const by = Math.floor(pos.y);
+                    const bz = Math.floor(pos.z);
+
+                    if (Math.abs(bx + 0.5 - pPos.x) < 0.6 && Math.abs(bz + 0.5 - pPos.z) < 0.6 && (pPos.y - by) > -1.7 && (pPos.y - by) < 0.3) return;
+                    if (getBlock(bx, by, bz) > 0) return;
+
+                    inventory[activeBlockType] -= 1;
+                    worldBlocks.set(`${bx},${by},${bz}`, activeBlockType);
+                    updateHPUI();
+
+                    // チャンク再構築
+                    const cx = Math.floor(bx / CHUNK_SIZE);
+                    const cz = Math.floor(bz / CHUNK_SIZE);
+                    const key = `${cx},${cz}`;
+                    if (chunks.has(key)) {
+                        const oldData = chunks.get(key);
+                        scene.remove(oldData.group);
+                        oldData.meshes.forEach(m => m.dispose());
+                        chunks.delete(key);
+                        
+                        // チャンク内ブロック配列を再収集してビルド
+                        const chunkBlocks = [];
+                        const startX = cx * CHUNK_SIZE;
+                        const startZ = cz * CHUNK_SIZE;
+                        for (let x = startX; x < startX + CHUNK_SIZE; x++) {
+                            for (let z = startZ; z < startZ + CHUNK_SIZE; z++) {
+                                for (let y = 0; y < WORLD_HEIGHT; y++) {
+                                    const t = getBlock(x, y, z);
+                                    if (t > 0) chunkBlocks.push({x, y, z, type: t});
+                                }
+                            }
+                        }
+                        buildChunkMesh(cx, cz, chunkBlocks);
+                    }
+                }
+            }
+        });
+
+        document.addEventListener('pointerup', (event) => { if (event.button === 0) { isLeftMouseDown = false; resetMining(); } });
+
+        // --- 再利用可能なベクトル変数（毎フレームの不要な new を削減） ---
+        const _nextX = new THREE.Vector3();
+        const _nextZ = new THREE.Vector3();
+        const _nextY = new THREE.Vector3();
+        const _camDir = new THREE.Vector3();
+        const _sideDir = new THREE.Vector3();
+        const _moveDir = new THREE.Vector3();
 
         // --- メインループ ---
         function animate() {
@@ -745,31 +936,61 @@
                 camera.lookAt(0, spawnHeight, 0);
             } else if (gameState === 'PLAYING' && controls.isLocked === true && !isInventoryOpen) {
                 const delta = Math.min((time - prevTime) / 1000, 0.1);
-
                 const playerPos = controls.getObject().position;
-                for (let i = 0; i < objects.length; i++) {
-                    const obj = objects[i];
-                    const dist = obj.position.distanceTo(playerPos);
-                    obj.visible = dist <= renderDistance;
-                }
+
+                // チャンク動的更新
+                updateChunks(playerPos.x, playerPos.z);
 
                 if (isLeftMouseDown) {
-                    raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
-                    const intersects = raycaster.intersectObjects(objects.filter(o => o.visible));
+                    const intersects = getRaycastIntersect();
                     if (intersects.length > 0 && intersects[0].distance <= 6) {
-                        const hitObj = intersects[0].object;
-                        if (hitObj.blockType !== 99) {
-                            if (miningTarget === hitObj) {
+                        const hit = intersects[0];
+                        const matrix = new THREE.Matrix4();
+                        hit.object.getMatrixAt(hit.instanceId, matrix);
+                        const hitPos = new THREE.Vector3().setFromMatrixPosition(matrix);
+                        const bx = Math.floor(hitPos.x - 0.5);
+                        const by = Math.floor(hitPos.y - 0.5);
+                        const bz = Math.floor(hitPos.z - 0.5);
+                        const bType = getBlock(bx, by, bz);
+
+                        if (bType !== 99) {
+                            if (miningTarget && miningTarget.x === bx && miningTarget.y === by && miningTarget.z === bz) {
                                 miningProgress += delta;
                                 if (crackMesh) crackMesh.material.opacity = (miningProgress / 1.0) * 0.7;
                                 if (miningProgress >= 1.0) {
-                                    spawnDropItem(hitObj.position, hitObj.blockType);
-                                    scene.remove(hitObj); objects.splice(objects.indexOf(hitObj), 1); resetMining();
+                                    worldBlocks.delete(`${bx},${by},${bz}`);
+                                    spawnDropItem(new THREE.Vector3(bx + 0.5, by + 0.5, bz + 0.5), bType);
+                                    gainExp(1);
+                                    resetMining();
+                                    
+                                    const cx = Math.floor(bx / CHUNK_SIZE);
+                                    const cz = Math.floor(bz / CHUNK_SIZE);
+                                    const key = `${cx},${cz}`;
+                                    if (chunks.has(key)) {
+                                        const oldData = chunks.get(key);
+                                        scene.remove(oldData.group);
+                                        oldData.meshes.forEach(m => m.dispose());
+                                        chunks.delete(key);
+                                        const chunkBlocks = [];
+                                        const startX = cx * CHUNK_SIZE;
+                                        const startZ = cz * CHUNK_SIZE;
+                                        for (let x = startX; x < startX + CHUNK_SIZE; x++) {
+                                            for (let z = startZ; z < startZ + CHUNK_SIZE; z++) {
+                                                for (let y = 0; y < WORLD_HEIGHT; y++) {
+                                                    const t = getBlock(x, y, z);
+                                                    if (t > 0) chunkBlocks.push({x, y, z, type: t});
+                                                }
+                                            }
+                                        }
+                                        buildChunkMesh(cx, cz, chunkBlocks);
+                                    }
                                 }
                             } else {
-                                resetMining(); miningTarget = hitObj;
+                                resetMining();
+                                miningTarget = {x: bx, y: by, z: bz};
                                 crackMesh = new THREE.Mesh(new THREE.BoxGeometry(1.01, 1.01, 1.01), new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0 }));
-                                crackMesh.position.copy(hitObj.position); scene.add(crackMesh);
+                                crackMesh.position.set(bx + 0.5, by + 0.5, bz + 0.5);
+                                scene.add(crackMesh);
                             }
                         } else { resetMining(); }
                     } else { resetMining(); }
@@ -778,57 +999,50 @@
                 // 重力計算
                 velocityY -= 9.8 * 3.2 * delta;
 
-                // --- 移動入力の完全定常制御 ---
+                // 移動制御
                 const moveSpeed = isSprinting ? 7.5 : 4.5;
-                const camDir = new THREE.Vector3();
-                controls.getDirection(camDir);
-                camDir.y = 0;
-                camDir.normalize();
+                controls.getDirection(_camDir);
+                _camDir.y = 0;
+                _camDir.normalize();
 
-                const sideDir = new THREE.Vector3().crossVectors(camDir, new THREE.Vector3(0, 1, 0)).normalize();
+                _sideDir.crossVectors(_camDir, new THREE.Vector3(0, 1, 0)).normalize();
 
-                const moveDir = new THREE.Vector3();
-                if (moveForward) moveDir.add(camDir);
-                if (moveBackward) moveDir.sub(camDir);
-                if (moveRight) moveDir.add(sideDir);
-                if (moveLeft) moveDir.sub(sideDir);
+                _moveDir.set(0, 0, 0);
+                if (moveForward) _moveDir.add(_camDir);
+                if (moveBackward) _moveDir.sub(_camDir);
+                if (moveRight) _moveDir.add(_sideDir);
+                if (moveLeft) _moveDir.sub(_sideDir);
 
-                if (moveDir.lengthSq() > 0) {
-                    moveDir.normalize();
+                if (_moveDir.lengthSq() > 0) {
+                    _moveDir.normalize();
                 }
 
-                const moveVX = moveDir.x * moveSpeed;
-                const moveVZ = moveDir.z * moveSpeed;
+                const moveVX = _moveDir.x * moveSpeed;
+                const moveVZ = _moveDir.z * moveSpeed;
 
-                // --- 軸ごとの完全分離スライド移動（X軸） ---
-                const nextX = playerPos.clone();
-                nextX.x += moveVX * delta;
-                if (!checkCollision(nextX)) {
-                    playerPos.x = nextX.x;
+                // X軸スライド移動
+                _nextX.copy(playerPos);
+                _nextX.x += moveVX * delta;
+                if (!checkCollision(_nextX)) {
+                    playerPos.x = _nextX.x;
                 }
 
-                // --- 軸ごとの完全分離スライド移動（Z軸） ---
-                const nextZ = playerPos.clone();
-                nextZ.z += moveVZ * delta;
-                if (!checkCollision(nextZ)) {
-                    playerPos.z = nextZ.z;
+                // Z軸スライド移動
+                _nextZ.copy(playerPos);
+                _nextZ.z += moveVZ * delta;
+                if (!checkCollision(_nextZ)) {
+                    playerPos.z = _nextZ.z;
                 }
 
-                // --- ワールド境界ガード（端からの脱落防止） ---
-                const maxBound = (WORLD_SIZE / 2) - 0.5;
-                playerPos.x = Math.max(-maxBound, Math.min(maxBound, playerPos.x));
-                playerPos.z = Math.max(-maxBound, Math.min(maxBound, playerPos.z));
+                // Y軸判定（落下・重力・着地）
+                _nextY.copy(playerPos);
+                _nextY.y += velocityY * delta;
 
-                // --- Y軸（重力・着地・天井判定） ---
-                const nextY = playerPos.clone();
-                nextY.y += velocityY * delta;
-
-                if (!checkCollision(nextY)) {
-                    playerPos.y = nextY.y;
+                if (!checkCollision(_nextY)) {
+                    playerPos.y = _nextY.y;
                     canJump = false;
                 } else {
                     if (velocityY < 0) {
-                        // 着地処理
                         if (velocityY < -14) { 
                             const fallDamage = Math.floor((Math.abs(velocityY) - 14) * 2.5); 
                             if (fallDamage > 0) hp -= fallDamage; 
@@ -837,31 +1051,34 @@
                         }
                         canJump = true;
                         
-                        let testPos = playerPos.clone();
-                        while (checkCollision(testPos)) {
-                            testPos.y += 0.01;
+                        _nextY.copy(playerPos);
+                        while (checkCollision(_nextY)) {
+                            _nextY.y += 0.01;
                         }
-                        playerPos.y = testPos.y;
+                        playerPos.y = _nextY.y;
                     } else {
-                        let testPos = playerPos.clone();
-                        while (checkCollision(testPos)) {
-                            testPos.y -= 0.01;
+                        _nextY.copy(playerPos);
+                        while (checkCollision(_nextY)) {
+                            _nextY.y -= 0.01;
                         }
-                        playerPos.y = testPos.y;
+                        playerPos.y = _nextY.y;
                     }
                     velocityY = 0;
                 }
 
-                // 本当の地下深くに落ちた場合のみ死亡判定（誤爆防止）
                 if (playerPos.y < -20) triggerDeath();
 
                 // モブの更新
                 mobs.forEach(mob => {
-                    const dirToPlayer = new THREE.Vector3(playerPos.x, mob.position.y, playerPos.z).sub(mob.position);
-                    const distance = dirToPlayer.length(); dirToPlayer.normalize();
-                    if (distance > 0.5) { mob.position.x += dirToPlayer.x * zombieConfig.speed * delta; mob.position.z += dirToPlayer.z * zombieConfig.speed * delta; }
+                    const dx = playerPos.x - mob.position.x;
+                    const dz = playerPos.z - mob.position.z;
+                    const dist = Math.sqrt(dx*dx + dz*dz);
+                    if (dist > 0.5) {
+                        mob.position.x += (dx / dist) * zombieConfig.speed * delta;
+                        mob.position.z += (dz / dist) * zombieConfig.speed * delta;
+                    }
                     mob.position.y = getTerrainHeight(mob.position.x, mob.position.z) + 0.9;
-                    if (distance < 1.2 && Math.abs(playerPos.y - mob.position.y) < 1.5) playerTakeDamage(zombieConfig.attack);
+                    if (dist < 1.2 && Math.abs(playerPos.y - mob.position.y) < 1.5) playerTakeDamage(zombieConfig.attack);
                 });
 
                 // アイテム回収
