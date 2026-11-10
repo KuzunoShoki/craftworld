@@ -362,7 +362,7 @@
 
         // --- ゲーム変数 ---
         let hp = 20; let isInventoryOpen = false; let lastDamageTime = 0;
-        const mobs = []; const drops = []; const MAX_MOBS = 3; // 最大モブ数を減らして快適に
+        const mobs = []; const drops = []; const MAX_MOBS = 3;
         let isLeftMouseDown = false; let miningTarget = null; let miningProgress = 0; let crackMesh = null;
 
         let playerStatus = { level: 1, exp: 0, nextLevelExp: 5, attack: 3, defense: 1 };
@@ -585,7 +585,6 @@
             controls.getObject().rotation.set(0, 0, 0);
         }
 
-        // ゾンビの出現頻度を大幅に低く変更 (7秒ごと、最大3匹)
         const mobGeometry = new THREE.BoxGeometry(0.6, 1.8, 0.6);
         function spawnMob() {
             if (gameState !== 'PLAYING' || mobs.length >= MAX_MOBS || !controls.isLocked) return;
@@ -608,7 +607,7 @@
 
         // --- 操作＆入力 ---
         let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false, isSprinting = false, canJump = false;
-        const velocity = new THREE.Vector3(), direction = new THREE.Vector3(); let prevTime = performance.now();
+        const velocity = new THREE.Vector3(); let prevTime = performance.now();
 
         document.addEventListener('keydown', (e) => {
             if (gameState !== 'PLAYING') return;
@@ -707,7 +706,6 @@
                 const obj = objects[i];
                 if (!obj.visible) continue;
 
-                // 範囲外のオブジェクトをスキップ
                 if (Math.abs(obj.position.x - pos.x) > 1.2 || Math.abs(obj.position.y - (pos.y - 0.8)) > 1.8 || Math.abs(obj.position.z - pos.z) > 1.2) {
                     continue;
                 }
@@ -767,58 +765,66 @@
                     } else { resetMining(); }
                 }
 
-                // 物理演算
-                velocity.x -= velocity.x * 12.0 * delta; 
-                velocity.z -= velocity.z * 12.0 * delta; 
+                // 物理演算（減速と重力）
+                velocity.x -= velocity.x * 10.0 * delta; 
+                velocity.z -= velocity.z * 10.0 * delta; 
                 velocity.y -= 9.8 * 3.2 * delta;
 
-                direction.z = Number(moveForward) - Number(moveBackward); 
-                direction.x = Number(moveRight) - Number(moveLeft); 
-                direction.normalize();
+                // 入力方向ベクトルの算出
+                const inputDir = new THREE.Vector3();
+                if (moveForward) inputDir.z -= 1;
+                if (moveBackward) inputDir.z += 1;
+                if (moveLeft) inputDir.x -= 1;
+                if (moveRight) inputDir.x += 1;
+                inputDir.normalize();
 
-                const moveSpeed = isSprinting ? 75.0 : 42.0;
-                if (moveForward || moveBackward) velocity.z -= direction.z * moveSpeed * delta; 
-                if (moveLeft || moveRight) velocity.x -= direction.x * moveSpeed * delta;
+                const moveSpeed = isSprinting ? 22.0 : 14.0;
+                if (inputDir.lengthSq() > 0) {
+                    // カメラの向きに基づく相対ベクトル計算（PointerLockControls標準スタイル）
+                    const camDir = new THREE.Vector3();
+                    controls.getDirection(camDir);
+                    camDir.y = 0;
+                    camDir.normalize();
 
-                const moveDir = new THREE.Vector3();
-                controls.getDirection(moveDir);
-                moveDir.y = 0; moveDir.normalize();
-                const sideDir = new THREE.Vector3(-moveDir.z, 0, moveDir.x);
+                    const sideDir = new THREE.Vector3().crossVectors(camDir, new THREE.Vector3(0, 1, 0)).normalize();
 
-                let targetVX = 0;
-                let targetVZ = 0;
-                if (moveForward) { targetVX += -moveDir.x * velocity.z; targetVZ += -moveDir.z * velocity.z; }
-                if (moveBackward) { targetVX += moveDir.x * velocity.z; targetVZ += moveDir.z * velocity.z; }
-                if (moveRight) { targetVX += sideDir.x * velocity.x; targetVZ += sideDir.z * velocity.x; }
-                if (moveLeft) { targetVX += -sideDir.x * velocity.x; targetVZ += -sideDir.z * velocity.x; }
+                    const moveVector = new THREE.Vector3();
+                    moveVector.addScaledVector(camDir, -inputDir.z);
+                    moveVector.addScaledVector(sideDir, inputDir.x);
+                    moveVector.normalize();
 
-                // --- 軸ごとの完全分離スライド移動（すり抜け・引っかかり完全防止） ---
+                    velocity.x += moveVector.x * moveSpeed * delta * 10.0;
+                    velocity.z += moveVector.z * moveSpeed * delta * 10.0;
+                }
+
+                // --- 軸ごとの完全分離スライド移動（X軸） ---
                 const nextX = playerPos.clone();
-                nextX.x += targetVX * delta;
+                nextX.x += velocity.x * delta;
                 if (!checkCollision(nextX)) {
                     playerPos.x = nextX.x;
                 } else {
                     velocity.x = 0;
                 }
 
+                // --- 軸ごとの完全分離スライド移動（Z軸） ---
                 const nextZ = playerPos.clone();
-                nextZ.z += targetVZ * delta;
+                nextZ.z += velocity.z * delta;
                 if (!checkCollision(nextZ)) {
                     playerPos.z = nextZ.z;
                 } else {
                     velocity.z = 0;
                 }
 
-                // --- 完全に安全なY軸（重力・落下・着地）ボックス判定 ---
+                // --- Y軸（重力・着地・天井判定） ---
                 const nextY = playerPos.clone();
                 nextY.y += velocity.y * delta;
 
                 if (!checkCollision(nextY)) {
                     playerPos.y = nextY.y;
-                    canJump = false; // 空中にいるときはジャンプ不可
+                    canJump = false;
                 } else {
                     if (velocity.y < 0) {
-                        // 下方向（着地）
+                        // 着地処理
                         if (velocity.y < -14) { 
                             const fallDamage = Math.floor((Math.abs(velocity.y) - 14) * 2.5); 
                             if (fallDamage > 0) hp -= fallDamage; 
@@ -826,15 +832,20 @@
                             if (hp <= 0) triggerDeath(); 
                         }
                         canJump = true;
-                        // 床の上にピタッと合わせるため微調整
-                        while (checkCollision(playerPos)) {
-                            playerPos.y += 0.01;
+                        
+                        // 床面の位置へ補正
+                        let testPos = playerPos.clone();
+                        while (checkCollision(testPos)) {
+                            testPos.y += 0.01;
                         }
+                        playerPos.y = testPos.y;
                     } else {
-                        // 上方向（天井衝突）
-                        while (checkCollision(playerPos)) {
-                            playerPos.y -= 0.01;
+                        // 天井衝突処理
+                        let testPos = playerPos.clone();
+                        while (checkCollision(testPos)) {
+                            testPos.y -= 0.01;
                         }
+                        playerPos.y = testPos.y;
                     }
                     velocity.y = 0;
                 }
@@ -864,7 +875,6 @@
         }
 
         window.addEventListener('resize', () => { camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); });
-        updateHPUPT = updateHPUI;
         updateHPUI(); animate();
     </script>
 </body>
